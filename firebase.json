@@ -1,0 +1,23 @@
+{
+  "functions": [{
+    "source": "functions",
+    "codebase": "ha-sensors",
+    "runtime": "nodejs22",
+    "ignore": ["node_modules", ".git", "firebase-debug.log", "*.local"],
+    "predeploy": ["npm --prefix functions run build"]
+  }],
+  "hosting": {
+    "target": "normality",
+    "public": "web/dist",
+    "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+    "rewrites": [
+      { "source": "/api/**", "function": { "functionId": "haSensorsApi", "region": "australia-southeast1" } },
+      { "source": "**", "destination": "/index.html" }
+    ],
+    "headers": [
+      { "source": "**/*.@(js|css)", "headers": [{ "key": "Cache-Control", "value": "public,max-age=31536000,immutable" }] },
+      { "source": "/index.html", "headers": [{ "key": "Cache-Control", "value": "no-cache" }] }
+    ]
+  }
+}
+

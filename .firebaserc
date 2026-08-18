@@ -1,0 +1,15 @@
+{
+  "projects": {
+    "default": "soter-updater-59ead"
+  },
+  "targets": {
+    "soter-updater-59ead": {
+      "hosting": {
+        "normality": [
+          "soter-normality"
+        ]
+      }
+    }
+  },
+  "etags": {}
+}

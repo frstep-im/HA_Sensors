@@ -1,0 +1,16 @@
+{
+  "name": "soter-home-normality",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["functions", "web"],
+  "scripts": {
+    "build": "npm run build -w functions && npm run build -w web",
+    "test": "npm run test -w functions && npm run test -w web",
+    "lint": "npm run lint -w functions && npm run lint -w web",
+    "dev": "npm run dev -w web",
+    "secret:ha": "./scripts/set-secret.sh ha-sensors-ha-token 'Home Assistant long-lived access token'",
+    "secret:webhook": "./scripts/set-secret.sh ha-sensors-alert-webhook 'alert webhook URL'"
+  },
+  "engines": { "node": "22" }
+}
+
