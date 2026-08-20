@@ -7,9 +7,12 @@ import { logger } from "firebase-functions";
 import { onRequest } from "firebase-functions/v2/https";
 import { onSchedule } from "firebase-functions/v2/scheduler";
 import { createHash } from "node:crypto";
+import { isMotionActive, isTelevision, PowerSample, televisionFeatures, televisionSessions } from "./activity";
+import { checkpointLabel, checkpointStart, checkpointsBetween, latestCheckpoint } from "./checkpoints";
 import { validatePayload, verifySignature } from "./ingest";
 import { analyse } from "./normality";
-import { Config, EntityConfig, Features, SensorEvent, SensorKind, SoterEvent, SoterEventType } from "./types";
+import { conversationHistoryCard, conversationTypes } from "./soter";
+import { Config, EntityConfig, Features, SensorEvent, SensorKind, SoterEvent, SoterEventType, SoterHistoryCard } from "./types";
 
 initializeApp();
 
@@ -57,15 +60,16 @@ function sourceDb(projectId: string): Firestore {
   return getFirestore(app);
 }
 
-function conversationTypes(data: FirebaseFirestore.DocumentData): SoterEventType[] {
-  const text = [data.visitorType, data.interactionType, data.interactionSubtype, data.interactionTitle,
-    data.notificationSummary, data.notificationDescription, data.triggerSource, data.startedBy]
-    .filter((value) => typeof value === "string").join(" ").toLowerCase();
-  const types: SoterEventType[] = ["interaction"];
-  if (data.recognizedPersonIsResident === true || (Array.isArray(data.recognizedResidentIds) && data.recognizedResidentIds.length)) types.push("resident_recognized");
-  if (/\b(arriv|returned? home|came home|coming home|entry)\b/.test(text)) types.push("arrival");
-  if (/\b(depart|leav|left home|going out|exit)\b/.test(text)) types.push("departure");
-  return types;
+async function fetchConversationCards(config: Config, sourceIds: string[]): Promise<Map<string, SoterHistoryCard>> {
+  const database = sourceDb(config.soterProjectId), cards = new Map<string, SoterHistoryCard>();
+  const ids = [...new Set(sourceIds)];
+  for (let index = 0; index < ids.length; index += 200) {
+    const references = ids.slice(index, index + 200).map((id) => database.collection("devices").doc(config.soterDeviceId).collection("conversations").doc(id));
+    if (!references.length) continue;
+    const snapshots = await database.getAll(...references);
+    snapshots.forEach((snapshot) => { if (snapshot.exists) cards.set(snapshot.id, conversationHistoryCard(snapshot.data() ?? {})); });
+  }
+  return cards;
 }
 
 async function fetchSoter(config: Config, start: Date, end: Date): Promise<IdentifiedSoter[]> {
@@ -106,38 +110,40 @@ async function storeEvents(sensors: IdentifiedSensor[], soter: IdentifiedSoter[]
 
 const empty = (): Features => ({
   motionEvents: 0, activeMotionSensors: 0, currentMean: 0, currentMax: 0, powerMean: 0,
-  powerMax: 0, doorOpenings: 0, soterInteractions: 0, recognizedResidents: 0, arrivals: 0, departures: 0,
+  powerMax: 0, tvMinutes: 0, tvSessions: 0, doorOpenings: 0, soterInteractions: 0,
+  recognizedResidents: 0, arrivals: 0, departures: 0, visitorArrivals: 0,
 });
 const mean = (values: number[]) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
 
-function aggregate(sensors: SensorEvent[], soter: SoterEvent[]): Features {
+const powerSamples = (sensors: SensorEvent[]): PowerSample[] => sensors.flatMap((event) => event.kind === "power" && event.numericValue !== null ? [{
+  entityId: event.entityId, label: event.friendlyName ?? event.entityId,
+  observedAt: event.observedAt.toMillis(), value: event.numericValue,
+}] : []);
+
+function aggregate(sensors: SensorEvent[], soter: SoterEvent[], start: Date, end: Date, timezone: string): Features {
   const result = empty(), active = new Set<string>(), currents: number[] = [], powers: number[] = [];
-  for (const event of sensors) {
-    if (event.kind === "motion" && ["on", "detected", "true", "1"].includes(event.state.toLowerCase())) { result.motionEvents++; active.add(event.entityId); }
-    if (event.kind === "current" && event.numericValue !== null) currents.push(event.numericValue);
-    if (event.kind === "power" && event.numericValue !== null) powers.push(event.numericValue);
+  const startMillis = start.getTime(), endMillis = end.getTime();
+  for (const event of sensors.filter((value) => value.observedAt.toMillis() >= startMillis && value.observedAt.toMillis() < endMillis)) {
+    if (event.kind === "motion" && isMotionActive(event.state)) { result.motionEvents++; active.add(event.entityId); }
+    if (event.kind === "current" && (event.numericValue ?? 0) > 0) currents.push(event.numericValue!);
+    if (event.kind === "power" && (event.numericValue ?? 0) > 0 && !isTelevision(event.entityId, event.friendlyName ?? "")) powers.push(event.numericValue!);
   }
   result.activeMotionSensors = active.size;
   result.currentMean = mean(currents); result.currentMax = currents.length ? Math.max(...currents) : 0;
   result.powerMean = mean(powers); result.powerMax = powers.length ? Math.max(...powers) : 0;
+  Object.assign(result, televisionFeatures(powerSamples(sensors), startMillis, endMillis, timezone));
   for (const event of soter) {
     if (event.type === "door_opened") result.doorOpenings++;
     if (event.type === "interaction") result.soterInteractions++;
     if (event.type === "resident_recognized") result.recognizedResidents++;
     if (event.type === "arrival") result.arrivals++;
     if (event.type === "departure") result.departures++;
+    if (event.type === "visitor_arrival") result.visitorArrivals++;
   }
   return result;
 }
 
-const floorWindow = (date: Date, minutes: number) => new Date(Math.floor(date.getTime() / (minutes * 60_000)) * minutes * 60_000);
 const windowId = (date: Date) => date.toISOString().replace(/[:.]/g, "-");
-
-function localSlot(date: Date, config: Config) {
-  const parts = new Intl.DateTimeFormat("en-GB", { timeZone: config.timezone, weekday: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(date);
-  const val = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value ?? "";
-  return { dayType: ["Sat", "Sun"].includes(val("weekday")) ? "weekend" : "weekday", slot: Math.floor((Number(val("hour")) * 60 + Number(val("minute"))) / config.windowMinutes) };
-}
 
 async function createAlert(config: Config, id: string, start: Date, result: ReturnType<typeof analyse>, features: Features) {
   const ref = root().collection("alerts").doc(id);
@@ -155,27 +161,29 @@ async function createAlert(config: Config, id: string, start: Date, result: Retu
   }
 }
 
-async function analyseStoredWindow(config: Config, start: Date, sendAlert: boolean) {
-  const end = new Date(start.getTime() + config.windowMinutes * 60_000), from = Timestamp.fromDate(start), to = Timestamp.fromDate(end);
+async function analyseStoredCheckpoint(config: Config, end: Date, sendAlert: boolean) {
+  const start = checkpointStart(end, config.timezone), from = Timestamp.fromDate(start), to = Timestamp.fromDate(end);
+  const sensorFrom = Timestamp.fromMillis(start.getTime() - 24 * 3_600_000);
+  const checkpoint = checkpointLabel(end, config.timezone);
   const [sensorSnap, soterSnap, historySnap] = await Promise.all([
-    root().collection("sensor_events").where("observedAt", ">=", from).where("observedAt", "<", to).get(),
+    root().collection("sensor_events").where("observedAt", ">=", sensorFrom).where("observedAt", "<", to).get(),
     root().collection("soter_events").where("observedAt", ">=", from).where("observedAt", "<", to).get(),
-    root().collection("windows").where("startAt", ">=", Timestamp.fromMillis(start.getTime() - config.baselineDays * 86_400_000)).where("startAt", "<", from).get(),
+    root().collection("windows").where("endAt", ">=", Timestamp.fromMillis(end.getTime() - config.baselineDays * 86_400_000)).where("endAt", "<", to).get(),
   ]);
-  const features = aggregate(sensorSnap.docs.map((d) => d.data() as SensorEvent), soterSnap.docs.map((d) => d.data() as SoterEvent));
-  const local = localSlot(start, config);
-  const baseline = historySnap.docs.map((d) => d.data()).filter((d) => d.dayType === local.dayType && Math.abs(Number(d.slot) - local.slot) <= 1).map((d) => d.features as Features);
+  const features = aggregate(sensorSnap.docs.map((d) => d.data() as SensorEvent), soterSnap.docs.map((d) => d.data() as SoterEvent), start, end, config.timezone);
+  const history = historySnap.docs.map((document) => document.data()).filter((record) => typeof record.checkpoint === "string");
+  const baseline = history.filter((record) => record.checkpoint === checkpoint).map((record) => record.features as Features);
   const result = analyse(features, baseline, config.minimumBaselineWindows, config.alertThreshold);
   let consecutive = 0;
   if (result.status === "unusual") {
-    const previous = await root().collection("windows").orderBy("startAt", "desc").limit(Math.max(0, config.consecutiveWindows - 1)).get();
-    consecutive = 1 + previous.docs.filter((d) => ["unusual", "alert"].includes(d.data().status)).length;
+    const previous = history.sort((a, b) => (b.endAt as Timestamp).toMillis() - (a.endAt as Timestamp).toMillis()).slice(0, Math.max(0, config.consecutiveWindows - 1));
+    consecutive = 1 + previous.filter((record) => ["unusual", "alert"].includes(record.status)).length;
     if (consecutive >= config.consecutiveWindows) result.status = "alert";
   }
-  const id = windowId(start);
-  await root().collection("windows").doc(id).set({ startAt: from, endAt: to, ...local, features, ...result, consecutiveUnusualWindows: consecutive, analysedAt: Timestamp.now() }, { merge: true });
-  if (sendAlert && result.status === "alert") await createAlert(config, id, start, result, features);
-  return { id, features, ...result };
+  const id = `checkpoint-${windowId(end)}`;
+  await root().collection("windows").doc(id).set({ startAt: from, endAt: to, checkpoint, periodHours: 6, features, ...result, consecutiveUnusualWindows: consecutive, analysedAt: Timestamp.now() }, { merge: true });
+  if (sendAlert && result.status === "alert") await createAlert(config, id, end, result, features);
+  return { id, startAt: start.toISOString(), endAt: end.toISOString(), checkpoint, features, ...result };
 }
 
 async function collectSoterRange(config: Config, start: Date, end: Date) {
@@ -189,11 +197,18 @@ async function collectAndAnalyse(force = false) {
   if (!config.enabled && !force) return { skipped: true, reason: "Analysis is disabled." };
   const now = new Date(), fallback = new Date(now.getTime() - 30 * 60_000);
   const cursor = config.lastCollectedAt?.toDate();
-  const start = cursor ? new Date(Math.max(fallback.getTime(), cursor.getTime() - 10 * 60_000)) : fallback;
+  const classificationUpgrade = (config.soterClassificationVersion ?? 0) < 2;
+  const featureUpgrade = (config.analysisFeatureVersion ?? 0) < 2;
+  const start = classificationUpgrade ? new Date(now.getTime() - 48 * 3_600_000) : cursor ? new Date(Math.max(fallback.getTime(), cursor.getTime() - 10 * 60_000)) : fallback;
   const counts = await collectSoterRange(config, start, now);
-  const completedStart = floorWindow(new Date(now.getTime() - config.windowMinutes * 60_000), config.windowMinutes);
-  const analysis = await analyseStoredWindow(config, completedStart, true);
-  await root().set({ lastCollectedAt: Timestamp.fromDate(now), lastCollectionStatus: "ok", lastCollectionCounts: counts, lastCollectionError: FieldValue.delete() }, { merge: true });
+  const checkpoint = latestCheckpoint(now, config.timezone);
+  const alreadyAnalysed = (config.lastAnalysedCheckpointAt?.toMillis() ?? 0) >= checkpoint.getTime();
+  const analysis = force || featureUpgrade || !alreadyAnalysed ? await analyseStoredCheckpoint(config, checkpoint, true) : null;
+  await root().set({
+    lastCollectedAt: Timestamp.fromDate(now), lastCollectionStatus: "ok", lastCollectionCounts: counts,
+    lastCollectionError: FieldValue.delete(), soterClassificationVersion: 2, analysisFeatureVersion: 2,
+    ...(analysis ? { lastAnalysedCheckpointAt: Timestamp.fromDate(checkpoint) } : {}),
+  }, { merge: true });
   return { skipped: false, counts, analysis };
 }
 
@@ -219,30 +234,30 @@ async function cleanupExpiredNonces() {
 }
 
 async function rebuildRange(config: Config, first: Date, end: Date) {
-  const from = Timestamp.fromDate(first), to = Timestamp.fromDate(end);
+  const eventFirst = new Date(first.getTime() - 24 * 3_600_000), from = Timestamp.fromDate(eventFirst), to = Timestamp.fromDate(end);
   const [sensorSnap, soterSnap, olderSnap] = await Promise.all([
     root().collection("sensor_events").where("observedAt", ">=", from).where("observedAt", "<", to).get(),
     root().collection("soter_events").where("observedAt", ">=", from).where("observedAt", "<", to).get(),
-    root().collection("windows").where("startAt", ">=", Timestamp.fromMillis(first.getTime() - config.baselineDays * 86_400_000)).where("startAt", "<", from).get(),
+    root().collection("windows").where("endAt", ">=", Timestamp.fromMillis(first.getTime() - config.baselineDays * 86_400_000)).where("endAt", "<", Timestamp.fromDate(first)).get(),
   ]);
-  const sensorBuckets = new Map<number, SensorEvent[]>(), soterBuckets = new Map<number, SoterEvent[]>();
-  for (const doc of sensorSnap.docs) {
-    const event = doc.data() as SensorEvent, key = floorWindow(event.observedAt.toDate(), config.windowMinutes).getTime();
-    sensorBuckets.set(key, [...(sensorBuckets.get(key) ?? []), event]);
-  }
-  for (const doc of soterSnap.docs) {
-    const event = doc.data() as SoterEvent, key = floorWindow(event.observedAt.toDate(), config.windowMinutes).getTime();
-    soterBuckets.set(key, [...(soterBuckets.get(key) ?? []), event]);
-  }
-  const history = olderSnap.docs.map((doc) => doc.data() as FirebaseFirestore.DocumentData);
+  const sensors = sensorSnap.docs.map((document) => document.data() as SensorEvent);
+  const soter = soterSnap.docs.map((document) => document.data() as SoterEvent);
+  const history = olderSnap.docs.map((document) => document.data() as FirebaseFirestore.DocumentData).filter((record) => typeof record.checkpoint === "string");
   const pending: Array<{ id: string; data: FirebaseFirestore.DocumentData }> = [];
-  let priorStatus = "normal", consecutive = 0;
-  for (let cursor = floorWindow(first, config.windowMinutes); cursor < end; cursor = new Date(cursor.getTime() + config.windowMinutes * 60_000)) {
-    const features = aggregate(sensorBuckets.get(cursor.getTime()) ?? [], soterBuckets.get(cursor.getTime()) ?? []);
-    const local = localSlot(cursor, config), cutoff = cursor.getTime() - config.baselineDays * 86_400_000;
+  const previous = [...history].sort((a, b) => (a.endAt as Timestamp).toMillis() - (b.endAt as Timestamp).toMillis()).at(-1);
+  let priorStatus = String(previous?.status ?? "normal"), consecutive = ["unusual", "alert"].includes(priorStatus) ? Number(previous?.consecutiveUnusualWindows ?? 1) : 0;
+  const checkpoints = checkpointsBetween(first, end, config.timezone);
+  for (const checkpointEnd of checkpoints) {
+    const start = checkpointStart(checkpointEnd, config.timezone), startMillis = start.getTime(), endMillis = checkpointEnd.getTime();
+    const features = aggregate(
+      sensors,
+      soter.filter((event) => event.observedAt.toMillis() >= startMillis && event.observedAt.toMillis() < endMillis),
+      start, checkpointEnd, config.timezone,
+    );
+    const checkpoint = checkpointLabel(checkpointEnd, config.timezone), cutoff = endMillis - config.baselineDays * 86_400_000;
     const baseline = history.filter((record) => {
-      const at = (record.startAt as Timestamp).toMillis();
-      return at >= cutoff && at < cursor.getTime() && record.dayType === local.dayType && Math.abs(Number(record.slot) - local.slot) <= 1;
+      const at = (record.endAt as Timestamp).toMillis();
+      return at >= cutoff && at < endMillis && record.checkpoint === checkpoint;
     }).map((record) => record.features as Features);
     const result = analyse(features, baseline, config.minimumBaselineWindows, config.alertThreshold);
     if (result.status === "unusual") {
@@ -250,14 +265,16 @@ async function rebuildRange(config: Config, first: Date, end: Date) {
       if (consecutive >= config.consecutiveWindows) result.status = "alert";
     } else consecutive = 0;
     priorStatus = result.status;
-    const data = { startAt: Timestamp.fromDate(cursor), endAt: Timestamp.fromMillis(cursor.getTime() + config.windowMinutes * 60_000), ...local, features, ...result, consecutiveUnusualWindows: consecutive, analysedAt: Timestamp.now() };
-    history.push(data); pending.push({ id: windowId(cursor), data });
+    const data = { startAt: Timestamp.fromDate(start), endAt: Timestamp.fromDate(checkpointEnd), checkpoint, periodHours: 6, features, ...result, consecutiveUnusualWindows: consecutive, analysedAt: Timestamp.now() };
+    history.push(data); pending.push({ id: `checkpoint-${windowId(checkpointEnd)}`, data });
   }
   for (let i = 0; i < pending.length; i += 450) {
     const batch = getFirestore().batch();
     for (const item of pending.slice(i, i + 450)) batch.set(root().collection("windows").doc(item.id), item.data, { merge: true });
     await batch.commit();
   }
+  const latest = checkpoints.at(-1);
+  if (latest) await root().set({ lastAnalysedCheckpointAt: Timestamp.fromDate(latest), soterClassificationVersion: 2, analysisFeatureVersion: 2 }, { merge: true });
 }
 
 function sanitize(input: unknown, existing: Config): Config {
@@ -365,12 +382,66 @@ api.use(async (req: AuthedRequest, res: Response, next: NextFunction) => {
 });
 
 api.get("/api/overview", async (req, res) => {
-  const hours = Math.min(2160, Math.max(1, Number(req.query.hours) || 168)), since = Timestamp.fromMillis(Date.now() - hours * 3_600_000);
+  const hours = Math.min(2160, Math.max(1, Number(req.query.hours) || 48)), since = Timestamp.fromMillis(Date.now() - hours * 3_600_000);
   const [config, windows, alerts, health] = await Promise.all([
-    loadConfig(), root().collection("windows").where("startAt", ">=", since).orderBy("startAt").get(),
+    loadConfig(), root().collection("windows").where("endAt", ">=", since).orderBy("endAt").get(),
     root().collection("alerts").where("observedAt", ">=", since).orderBy("observedAt", "desc").limit(50).get(), root().get(),
   ]);
-  res.json({ config: { ...config, lastCollectedAt: config.lastCollectedAt?.toDate().toISOString() ?? null }, health: iso(health.data() ?? {}), windows: windows.docs.map((d) => ({ id: d.id, ...iso(d.data()) })), alerts: alerts.docs.map((d) => ({ id: d.id, ...iso(d.data()) })) });
+  res.json({
+    config: iso(config as unknown as FirebaseFirestore.DocumentData), health: iso(health.data() ?? {}),
+    windows: windows.docs.filter((document) => typeof document.data().checkpoint === "string").map((document) => ({ id: document.id, ...iso(document.data()) })),
+    alerts: alerts.docs.map((document) => ({ id: document.id, ...iso(document.data()) })),
+  });
+});
+api.get("/api/events", async (req, res) => {
+  const hours = Math.min(720, Math.max(1, Number(req.query.hours) || 48)), now = Date.now();
+  const sinceMillis = now - hours * 3_600_000, since = Timestamp.fromMillis(sinceMillis), sensorSince = Timestamp.fromMillis(sinceMillis - 24 * 3_600_000), limit = 5000;
+  const [config, sensors, soter] = await Promise.all([
+    loadConfig(),
+    root().collection("sensor_events").where("observedAt", ">=", sensorSince).orderBy("observedAt", "desc").limit(limit).get(),
+    root().collection("soter_events").where("observedAt", ">=", since).orderBy("observedAt", "desc").limit(limit).get(),
+  ]);
+  const soterLabels: Partial<Record<SoterEventType, string>> = {
+    departure: "Occupant leaving", arrival: "Occupant returning", visitor_arrival: "Visitor arriving",
+    door_opened: "Door opening", door_left_open: "Door left open",
+  };
+  const sensorRecords = sensors.docs.map((document) => ({ id: document.id, event: document.data() as SensorEvent }));
+  const sensorEvents = sensorRecords.flatMap(({ id, event }) => {
+    const observedAt = event.observedAt.toMillis(), tv = isTelevision(event.entityId, event.friendlyName ?? "");
+    const meaningful = observedAt >= sinceMillis && (
+      (event.kind === "motion" && isMotionActive(event.state)) ||
+      (event.kind !== "motion" && !tv && (event.numericValue ?? 0) > 0)
+    );
+    if (!meaningful) return [];
+    return [{
+      id, source: "home_assistant", category: event.kind === "motion" ? "movement" : "energy", type: event.kind,
+      observedAt: event.observedAt.toDate().toISOString(), label: event.friendlyName ?? event.entityId, entityId: event.entityId,
+      state: event.state, value: event.numericValue, unit: event.unit ?? null,
+    }];
+  });
+  const tvEvents = televisionSessions(powerSamples(sensorRecords.map((record) => record.event)), now, config.timezone)
+    .filter((session) => session.endAt > sinceMillis && session.startAt < now)
+    .map((session) => ({
+      id: hash(`${session.entityId}|${session.startAt}|${session.endAt}`), source: "home_assistant", category: "energy", type: "tv_session",
+      observedAt: new Date(Math.max(sinceMillis, session.startAt)).toISOString(), startAt: new Date(session.startAt).toISOString(), endAt: new Date(session.endAt).toISOString(),
+      label: session.label, entityId: session.entityId, state: session.ongoing ? "on" : "complete", value: session.averagePower,
+      unit: "W", durationMinutes: session.durationMinutes, peakPower: session.peakPower, ongoing: session.ongoing,
+    }));
+  const conversationEventTypes = new Set<SoterEventType>(["interaction", "resident_recognized", "arrival", "departure", "visitor_arrival"]);
+  const soterRecords = soter.docs.map((document) => ({ id: document.id, event: document.data() as SoterEvent }));
+  let cards = new Map<string, SoterHistoryCard>();
+  try { cards = await fetchConversationCards(config, soterRecords.filter(({ event }) => conversationEventTypes.has(event.type)).map(({ event }) => event.sourceId)); }
+  catch (error) { logger.warn("Soter history cards unavailable; returning event fallbacks.", error); }
+  const soterEvents = soterRecords.flatMap(({ id, event }) => {
+    const label = soterLabels[event.type];
+    return label ? [{
+      id, source: "soter", category: "door", type: event.type,
+      observedAt: event.observedAt.toDate().toISOString(), label, state: null, value: null, unit: null,
+      history: cards.get(event.sourceId),
+    }] : [];
+  });
+  const events = [...sensorEvents, ...tvEvents, ...soterEvents].sort((a, b) => a.observedAt.localeCompare(b.observedAt));
+  res.json({ hours, timezone: config.timezone, since: since.toDate().toISOString(), truncated: sensors.size === limit || soter.size === limit, events });
 });
 api.put("/api/config", async (req: AuthedRequest, res) => {
   try { const config = sanitize(req.body, await loadConfig()); config.updatedBy = req.user?.email; await root().set(config, { merge: true }); res.json({ config }); }

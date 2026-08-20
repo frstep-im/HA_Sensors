@@ -17,6 +17,9 @@ export interface Config {
   consecutiveWindows: number;
   webhookEnabled: boolean;
   lastCollectedAt?: FirebaseFirestore.Timestamp;
+  lastAnalysedCheckpointAt?: FirebaseFirestore.Timestamp;
+  soterClassificationVersion?: number;
+  analysisFeatureVersion?: number;
   updatedAt?: FirebaseFirestore.Timestamp;
   updatedBy?: string;
 }
@@ -42,7 +45,15 @@ export interface SensorEvent {
   friendlyName?: string | null;
 }
 
-export type SoterEventType = "door_opened" | "door_closed" | "door_left_open" | "interaction" | "resident_recognized" | "arrival" | "departure";
+export type SoterEventType = "door_opened" | "door_closed" | "door_left_open" | "interaction" | "resident_recognized" | "arrival" | "departure" | "visitor_arrival";
+export interface SoterHistoryCard {
+  imageUrl?: string;
+  typeLabel: string;
+  title: string;
+  description?: string;
+  status?: string;
+  outcome?: string;
+}
 export interface SoterEvent {
   source: "soter";
   type: SoterEventType;
@@ -58,11 +69,14 @@ export interface Features {
   currentMax: number;
   powerMean: number;
   powerMax: number;
+  tvMinutes: number;
+  tvSessions: number;
   doorOpenings: number;
   soterInteractions: number;
   recognizedResidents: number;
   arrivals: number;
   departures: number;
+  visitorArrivals: number;
 }
 
 export interface Metric { median: number; mad: number; z: number }

@@ -1,13 +1,13 @@
 import { Analysis, Features, Metric } from "./types";
 
 export const FEATURE_KEYS: (keyof Features)[] = [
-  "motionEvents", "activeMotionSensors", "currentMean", "currentMax", "powerMean", "powerMax",
-  "doorOpenings", "soterInteractions", "recognizedResidents", "arrivals", "departures",
+  "motionEvents", "activeMotionSensors", "currentMean", "currentMax", "powerMean", "powerMax", "tvMinutes", "tvSessions",
+  "doorOpenings", "soterInteractions", "recognizedResidents", "arrivals", "departures", "visitorArrivals",
 ];
 const WEIGHTS: Record<keyof Features, number> = {
   motionEvents: 1.4, activeMotionSensors: .8, currentMean: 1, currentMax: .6,
-  powerMean: 1, powerMax: .6, doorOpenings: .8, soterInteractions: .6,
-  recognizedResidents: .5, arrivals: .5, departures: .5,
+  powerMean: .5, powerMax: .3, tvMinutes: 1.3, tvSessions: .7, doorOpenings: .8, soterInteractions: .6,
+  recognizedResidents: .5, arrivals: .5, departures: .5, visitorArrivals: .4,
 };
 
 export function median(values: number[]) {
@@ -32,7 +32,7 @@ export function analyse(current: Features, baseline: Features[], minimum: number
   const metrics: Record<string, Metric> = {};
   let weighted = 0, total = 0;
   for (const key of FEATURE_KEYS) {
-    const metric = robustMetric(current[key], baseline.map((sample) => sample[key]));
+    const metric = robustMetric(Number(current[key] ?? 0), baseline.map((sample) => Number(sample[key] ?? 0)));
     metrics[key] = metric;
     weighted += WEIGHTS[key] * metric.z * metric.z;
     total += WEIGHTS[key];
@@ -51,4 +51,3 @@ export function analyse(current: Features, baseline: Features[], minimum: number
 
 const human = (key: string) => key.replace(/([A-Z])/g, " $1").toLowerCase();
 const format = (value: number) => Number.isInteger(value) ? String(value) : value.toFixed(2);
-

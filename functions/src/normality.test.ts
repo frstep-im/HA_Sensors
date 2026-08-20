@@ -5,8 +5,9 @@ import { Features } from "./types";
 
 const sample = (motionEvents: number): Features => ({
   motionEvents, activeMotionSensors: motionEvents ? 1 : 0, currentMean: 1.2, currentMax: 2,
-  powerMean: 0, powerMax: 0, doorOpenings: 0, soterInteractions: 0,
+  powerMean: 0, powerMax: 0, tvMinutes: 90, tvSessions: 1, doorOpenings: 0, soterInteractions: 0,
   recognizedResidents: 0, arrivals: 0, departures: 0,
+  visitorArrivals: 0,
 });
 
 test("median handles odd and even arrays", () => {
@@ -20,4 +21,8 @@ test("large departure is unusual", () => {
   assert.equal(result.status, "unusual");
   assert.ok((result.normalityIndex ?? 100) < 30);
 });
-
+test("older checkpoints without TV fields remain comparable", () => {
+  const older = { ...sample(5), tvMinutes: undefined, tvSessions: undefined } as unknown as Features;
+  const result = analyse(sample(5), Array.from({ length: 7 }, () => older), 7, 30);
+  assert.ok(Number.isFinite(result.normalityIndex));
+});

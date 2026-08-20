@@ -13,7 +13,7 @@ flowchart LR
   API --> E["Idempotent reduced sensor events"]
   S["Soter Firestore\ndoor events + interactions"] -->|"read-only cross-project IAM"| CF["Scheduled analysis"]
   E --> CF
-  CF --> W["15-minute feature windows"] --> B["Robust time-of-day baseline"] --> A["Normality index + alerts"]
+  CF --> W["Six-hour checkpoint windows\nending 03:00, 09:00, 21:00"] --> B["Checkpoint-specific robust baseline"] --> A["Normality index + alerts"]
   A --> WEB["Authenticated Firebase dashboard"]
 ```
 
@@ -23,9 +23,11 @@ The collector maintains a persistent SQLite queue, subscribes to live `state_cha
 
 ## How scoring works
 
-Each completed window contains aggregate movement counts, active sensor count, average/peak current or power, door openings, Soter interactions, recognised-resident events, and conservatively inferred arrival/departure events. No image, name, scene description, transcript, or unrelated Home Assistant attribute is copied.
+Each completed checkpoint contains meaningful movement detections, active sensor count, television-on minutes and viewing-period count, positive non-TV power/current readings, door openings, Soter interactions, recognised-resident events, occupant arrivals/departures, and visitor arrivals from the preceding six local hours. Cleared movement states and zero-power readings are excluded. TV power is converted into debounced viewing periods; short periods beginning around 03:00 are discarded as the known meter artefact. Soter conversations that identify Judy are classified as occupant events even when Face ID did not produce structured resident fields. No name, image, scene description, transcript, or unrelated Home Assistant attribute is copied into the analysis project.
 
-The window is compared with nearby time slots from the prior 42 days, separated into weekday/weekend. Median and median absolute deviation (MAD) produce a robust distance, converted to a 0–100 normality index. Defaults require an index below 30 for two consecutive windows before an alert is created. The model stays in **learning** mode until 24 comparable windows exist.
+Normality is reported three times each day: 03:00, 09:00, and 21:00 in the configured Home Assistant timezone. Each six-hour window is compared only with the same reporting checkpoint from the prior 42 days; the variable 09:00–15:00 daytime period is intentionally not scored. Median and median absolute deviation (MAD) produce a robust distance, converted to a 0–100 normality index. Defaults require an index below 30 at two consecutive checkpoints before an alert is created. The model stays in **learning** mode until 24 comparable checkpoints exist.
+
+The authenticated event explorer defaults to the last 48 hours and displays meaningful movement, positive appliance use, TV viewing periods, occupant leaving, occupant returning, visitor arrival, door opening, and door-left-open events on a local-time axis. A rolling one-hour activity graph shows total movement and each sensor as stepped lines. Charts use three-hour local-time grid lines, show details on hover, and support drag-to-select time zoom. Raw activity lists are intentionally omitted.
 
 This is decision support, not an emergency, medical, or life-safety system. A low index means “different”, not “harm”. Sensor outages, holidays, visitors, and changed routines can produce legitimate departures.
 
