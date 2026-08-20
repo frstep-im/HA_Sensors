@@ -8,7 +8,6 @@ export interface Config {
   householdId: string;
   soterProjectId: string;
   soterDeviceId: string;
-  homeAssistantBaseUrl: string;
   timezone: string;
   entities: EntityConfig[];
   windowMinutes: number;
@@ -20,6 +19,16 @@ export interface Config {
   lastCollectedAt?: FirebaseFirestore.Timestamp;
   updatedAt?: FirebaseFirestore.Timestamp;
   updatedBy?: string;
+}
+
+export interface CollectorHealth {
+  id: string;
+  version?: string;
+  queueDepth?: number;
+  sentAt: FirebaseFirestore.Timestamp;
+  lastSeenAt: FirebaseFirestore.Timestamp;
+  lastEventAt?: FirebaseFirestore.Timestamp;
+  lastBackfillAt?: FirebaseFirestore.Timestamp;
 }
 
 export interface SensorEvent {
@@ -65,4 +74,3 @@ export interface Analysis {
   reasons: string[];
   metrics: Record<string, Metric>;
 }
-

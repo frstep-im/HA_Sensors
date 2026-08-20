@@ -1,34 +1,37 @@
 # Soter Household Activity Normality
 
-An authenticated Firebase web app that combines Home Assistant movement/current sensors with privacy-minimised Soter doorstep events, learns a household-specific activity baseline, and highlights sustained departures from that baseline.
+An authenticated Firebase web app and Home Assistant OS app that combine movement/current sensors with privacy-minimised Soter doorstep events, learn a household-specific activity baseline, and highlight sustained departures from it.
 
-The pilot household is `household-mpcck67b-epr7fs` in `doorassistant-bc50a`. The application and derived data run in `soter-updater-59ead` on a separate Hosting site, `soter-normality`, so deploying it does not replace the existing updater dashboard.
+The pilot household is `household-mpcck67b-epr7fs` in `doorassistant-bc50a`. The application and derived data run in `soter-updater-59ead` on the separate Firebase Hosting site `soter-normality`.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  HA["Remote Home Assistant\nHistory API"] -->|"HTTPS + token\nevery 5 minutes"| CF["Scheduled Firebase function"]
-  S["Soter Firestore\ndoor events + interactions"] -->|"read-only cross-project IAM"| CF
-  SM["Google Secret Manager"] --> CF
-  CF --> E["Idempotent reduced events"] --> W["15-minute feature windows"] --> B["Robust time-of-day baseline"] --> A["Normality index + alerts"]
-  A --> API["Authenticated API"] --> WEB["Firebase Hosting dashboard"]
-  A -. optional .-> HOOK["Alert webhook"]
+  HA["Home Assistant OS\nselected entities"] -->|"Internal WebSocket\nand History API"| APP["Soter Activity Collector\nHA OS app"]
+  APP -->|"HMAC-signed outbound HTTPS\nbatched + retried"| API["Firebase ingest endpoint"]
+  API --> E["Idempotent reduced sensor events"]
+  S["Soter Firestore\ndoor events + interactions"] -->|"read-only cross-project IAM"| CF["Scheduled analysis"]
+  E --> CF
+  CF --> W["15-minute feature windows"] --> B["Robust time-of-day baseline"] --> A["Normality index + alerts"]
+  A --> WEB["Authenticated Firebase dashboard"]
 ```
 
-Five-minute History API pulls are a better fit than a permanent WebSocket for this use case: analysis uses completed 15-minute windows, while overlapping cursors and deterministic IDs make retries safe. Home Assistant must be reachable over HTTPS, such as through Home Assistant Cloud or a properly secured reverse proxy.
+No service connects inbound to the home. The collector uses Home Assistant's Supervisor-provided API token internally and makes ordinary outbound HTTPS requests, so the router needs no open ports and Tailscale can remain an administrative path only.
+
+The collector maintains a persistent SQLite queue, subscribes to live `state_changed` events, and runs overlapping History API recovery after startup, reconnects, and each hour. Firebase accepts only requests with a valid timestamped HMAC signature, rejects replayed nonces, enforces the configured entity allowlist, and writes deterministic event IDs so retries are safe.
 
 ## How scoring works
 
-Each completed window contains only aggregate movement counts, active sensor count, average/peak current or power, door openings, Soter interactions, recognised-resident events, and conservatively inferred arrival/departure events. No image, name, scene description, or transcript is copied from Soter.
+Each completed window contains aggregate movement counts, active sensor count, average/peak current or power, door openings, Soter interactions, recognised-resident events, and conservatively inferred arrival/departure events. No image, name, scene description, transcript, or unrelated Home Assistant attribute is copied.
 
 The window is compared with nearby time slots from the prior 42 days, separated into weekday/weekend. Median and median absolute deviation (MAD) produce a robust distance, converted to a 0–100 normality index. Defaults require an index below 30 for two consecutive windows before an alert is created. The model stays in **learning** mode until 24 comparable windows exist.
 
-This is decision support, not an emergency, medical, or life-safety system. A low index means “different”, not “harm”. Sensor outages, holidays, visitors, or changed routines can all produce legitimate deviations.
+This is decision support, not an emergency, medical, or life-safety system. A low index means “different”, not “harm”. Sensor outages, holidays, visitors, and changed routines can produce legitimate departures.
 
-## Setup
+## Development
 
-Requirements: Node.js 22, Firebase CLI, Google Cloud CLI, and access to both projects.
+Requirements: Node.js 22 and Python 3.11 or newer.
 
 ```sh
 npm install
@@ -36,10 +39,22 @@ npm test
 npm run build
 ```
 
-Store the Home Assistant long-lived access token without putting it in shell history:
+The repository root is a valid Home Assistant app repository (`repository.yaml`). The app itself is in `home_assistant_collector/`.
+
+## Firebase deployment
+
+Requirements: Firebase CLI, Google Cloud CLI, and access to both Firebase projects.
+
+Create a random secret of at least 32 characters. Store the same value in Firebase Secret Manager and, later, the HA app's `ingest_secret` option. The helper reads without placing the value in shell history:
 
 ```sh
-npm run secret:ha
+npm run secret:ingest
+```
+
+Optional alert webhook URLs use a separate secret:
+
+```sh
+npm run secret:webhook
 ```
 
 One-time least-privilege runtime identity:
@@ -54,37 +69,34 @@ gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:$SA" 
 gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:$SA" --role roles/secretmanager.secretAccessor
 ```
 
-Create/link the isolated Hosting site and deploy:
+Deploy the function and isolated Hosting site:
 
 ```sh
-npx firebase-tools hosting:sites:create soter-normality --project soter-updater-59ead
-npx firebase-tools target:apply hosting normality soter-normality --project soter-updater-59ead
 npx firebase-tools deploy --only functions:ha-sensors,hosting:normality --project soter-updater-59ead
 ```
 
-Sign in at `https://soter-normality.web.app`, open Settings, and configure entities one per line:
+## Configure and install
 
-```text
-binary_sensor.hall_motion,motion,Hall
-binary_sensor.bedroom_motion,motion,Bedroom
-sensor.kettle_current,current,Kettle
-sensor.tv_power,power,Television
-```
+1. Sign in at [soter-normality.web.app](https://soter-normality.web.app), open Settings, and save the entity allowlist. Use one line per entity:
 
-Save with scheduled collection off, run the 14-day backfill, inspect the baseline, then enable collection. Use `motion` for binary movement, `current` for amperes, and `power` for watts.
+   ```text
+   binary_sensor.hall_motion,motion,Hall
+   binary_sensor.bedroom_motion,motion,Bedroom
+   sensor.kettle_current,current,Kettle
+   sensor.tv_power,power,Television
+   ```
+
+2. In Home Assistant OS, open **Settings → Apps → App store → Repositories**, add `https://github.com/frstep-im/HA_Sensors`, and install **Soter Activity Collector**.
+3. Configure the same entity IDs and kinds in the app, paste the shared ingest secret, and start it.
+4. Confirm the dashboard shows `haos-collector-001` as online with queue depth zero.
+5. Enable analysis in the dashboard and rebuild 14 days after the first HA history upload completes.
+
+The default initial HA recovery is 336 hours. It is limited by the Recorder retention configured in Home Assistant.
 
 ## Data and operations
 
-Derived data lives under `normality_households/{householdId}` with `sensor_events`, `soter_events`, `windows`, and `alerts` subcollections. Raw reduced events carry a 90-day `expiresAt` field; enable a Firestore TTL policy on that field after confirming the study retention policy. Windows can be retained longer for seasonal analysis.
+Derived data lives under `normality_households/{householdId}` with `sensor_events`, `soter_events`, `windows`, `alerts`, and short-lived `ingest_nonces` subcollections. Reduced events and nonces carry an `expiresAt` field; configure Firestore TTL for the intended retention policy. Feature windows can be retained longer for seasonal analysis.
 
-The browser never reads Firestore directly. Firebase Authentication is checked again by the API against a verified-email allowlist, and existing updater Firestore rules are not modified. The runtime identity has read-only access to the source Soter project.
+The browser never reads Firestore directly. Firebase Authentication is checked by the API against a verified-email allowlist, and existing updater Firestore rules are not modified. The runtime identity has read-only access to the source Soter project.
 
-For rollout, operate in shadow mode for at least two weeks, label false positives, monitor data freshness, and agree who receives/acknowledges alerts before enabling the optional webhook. If collection is stale or in error, do not interpret the last score as current.
-
-## Repository
-
-- `functions/`: ingestion, Soter feature reduction, robust scoring, authenticated API, schedule.
-- `web/`: responsive React dashboard and configuration interface.
-- `scripts/`: secret entry helper that avoids command-line/history exposure.
-- `.github/workflows/ci.yml`: compile and test checks.
-
+For rollout, operate in shadow mode for at least two weeks, label false positives, monitor collector freshness and queue depth, and agree who receives and acknowledges alerts before enabling the optional webhook. If the collector is stale, do not interpret the last score as current.

@@ -1,0 +1,29 @@
+configuration:
+  firebase_ingest_url:
+    name: Firebase ingest URL
+    description: HTTPS endpoint that receives signed sensor batches.
+  household_id:
+    name: Household ID
+    description: Household receiving these sensor readings.
+  collector_id:
+    name: Collector ID
+    description: Stable, unique name for this Home Assistant installation.
+  ingest_secret:
+    name: Ingest secret
+    description: Shared secret from Firebase Secret Manager; at least 32 characters.
+  entities:
+    name: Sensor entities
+    description: Allowlisted Home Assistant sensors and their analysis kind.
+    fields:
+      entity_id:
+        name: Entity ID
+      kind:
+        name: Sensor kind
+      label:
+        name: Display label
+  upload_interval_seconds:
+    name: Upload interval
+    description: Seconds between event batches and health heartbeats.
+  history_backfill_hours:
+    name: Initial history
+    description: Hours recovered from Recorder when the collector is first installed.

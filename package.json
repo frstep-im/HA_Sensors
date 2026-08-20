@@ -5,12 +5,12 @@
   "workspaces": ["functions", "web"],
   "scripts": {
     "build": "npm run build -w functions && npm run build -w web",
-    "test": "npm run test -w functions && npm run test -w web",
+    "test": "npm run test -w functions && npm run test -w web && npm run test:addon",
+    "test:addon": "python3 -m unittest discover -s home_assistant_collector/tests -v",
     "lint": "npm run lint -w functions && npm run lint -w web",
     "dev": "npm run dev -w web",
-    "secret:ha": "./scripts/set-secret.sh ha-sensors-ha-token 'Home Assistant long-lived access token'",
+    "secret:ingest": "./scripts/set-secret.sh ha-sensors-ingest-secret 'shared collector ingest secret (32+ characters)'",
     "secret:webhook": "./scripts/set-secret.sh ha-sensors-alert-webhook 'alert webhook URL'"
   },
   "engines": { "node": "22" }
 }
-

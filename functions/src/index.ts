@@ -7,6 +7,7 @@ import { logger } from "firebase-functions";
 import { onRequest } from "firebase-functions/v2/https";
 import { onSchedule } from "firebase-functions/v2/scheduler";
 import { createHash } from "node:crypto";
+import { validatePayload, verifySignature } from "./ingest";
 import { analyse } from "./normality";
 import { Config, EntityConfig, Features, SensorEvent, SensorKind, SoterEvent, SoterEventType } from "./types";
 
@@ -18,7 +19,7 @@ const SOURCE_PROJECT = "doorassistant-bc50a";
 const SOTER_DEVICE = "e4ca4cf8b0e37b91";
 const REGION = "australia-southeast1";
 const RUNTIME_SA = `ha-sensors-runtime@${TARGET_PROJECT}.iam.gserviceaccount.com`;
-const TOKEN_SECRET = "ha-sensors-ha-token";
+const INGEST_SECRET = "ha-sensors-ingest-secret";
 const WEBHOOK_SECRET = "ha-sensors-alert-webhook";
 const root = () => getFirestore().collection("normality_households").doc(HOUSEHOLD);
 const secrets = new SecretManagerServiceClient();
@@ -26,7 +27,7 @@ const admins = new Set((process.env.ADMIN_EMAILS ?? "intermentisai@gmail.com,fra
 
 const defaults: Config = {
   enabled: false, householdId: HOUSEHOLD, soterProjectId: SOURCE_PROJECT, soterDeviceId: SOTER_DEVICE,
-  homeAssistantBaseUrl: "", timezone: "Europe/London", entities: [], windowMinutes: 15,
+  timezone: "Europe/London", entities: [], windowMinutes: 15,
   baselineDays: 42, minimumBaselineWindows: 24, alertThreshold: 30,
   consecutiveWindows: 2, webhookEnabled: false,
 };
@@ -43,52 +44,11 @@ async function secret(id: string) {
   return value;
 }
 
-interface HAState {
-  entity_id?: string;
-  state?: string;
-  last_changed?: string;
-  last_updated?: string;
-  attributes?: { friendly_name?: string; unit_of_measurement?: string };
-}
 interface IdentifiedSensor extends SensorEvent { id: string }
 interface IdentifiedSoter extends SoterEvent { id: string }
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 32);
 const expiry = (date: Date) => Timestamp.fromMillis(date.getTime() + 90 * 86_400_000);
-
-async function fetchHA(config: Config, token: string, start: Date, end: Date): Promise<IdentifiedSensor[]> {
-  if (!config.homeAssistantBaseUrl || !config.entities.length) throw new Error("Home Assistant URL and entities must be configured.");
-  const map = new Map(config.entities.map((entity) => [entity.entityId, entity]));
-  const query = new URLSearchParams({
-    filter_entity_id: config.entities.map((entity) => entity.entityId).join(","),
-    end_time: end.toISOString(), minimal_response: "", no_attributes: "", significant_changes_only: "",
-  });
-  const url = `${config.homeAssistantBaseUrl}/api/history/period/${encodeURIComponent(start.toISOString())}?${query}`;
-  const response = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }, signal: AbortSignal.timeout(45_000),
-  });
-  if (!response.ok) throw new Error(`Home Assistant returned ${response.status}: ${(await response.text()).slice(0, 240)}`);
-  const history = await response.json() as HAState[][];
-  const events: IdentifiedSensor[] = [];
-  for (const series of history) {
-    let remembered = series.find((state) => state.entity_id)?.entity_id;
-    for (const state of series) {
-      remembered = state.entity_id ?? remembered;
-      const entity = remembered ? map.get(remembered) : undefined;
-      const observed = state.last_changed ?? state.last_updated;
-      if (!entity || !observed || state.state === undefined) continue;
-      const numeric = Number(state.state);
-      events.push({
-        id: hash(`${entity.entityId}|${observed}|${state.state}`), source: "home_assistant",
-        entityId: entity.entityId, kind: entity.kind, state: state.state,
-        numericValue: Number.isFinite(numeric) ? numeric : null, observedAt: Timestamp.fromDate(new Date(observed)),
-        unit: state.attributes?.unit_of_measurement ?? null,
-        friendlyName: entity.label ?? state.attributes?.friendly_name ?? null,
-      });
-    }
-  }
-  return events;
-}
 
 function sourceDb(projectId: string): Firestore {
   let app: App;
@@ -218,19 +178,19 @@ async function analyseStoredWindow(config: Config, start: Date, sendAlert: boole
   return { id, features, ...result };
 }
 
-async function collectRange(config: Config, token: string, start: Date, end: Date) {
-  const [sensors, soter] = await Promise.all([fetchHA(config, token, start, end), fetchSoter(config, start, end)]);
-  await storeEvents(sensors, soter);
-  return { sensorEvents: sensors.length, soterEvents: soter.length };
+async function collectSoterRange(config: Config, start: Date, end: Date) {
+  const soter = await fetchSoter(config, start, end);
+  await storeEvents([], soter);
+  return { soterEvents: soter.length };
 }
 
 async function collectAndAnalyse(force = false) {
   const config = await loadConfig();
-  if (!config.enabled && !force) return { skipped: true, reason: "Collection is disabled." };
-  const token = await secret(TOKEN_SECRET), now = new Date(), fallback = new Date(now.getTime() - 30 * 60_000);
+  if (!config.enabled && !force) return { skipped: true, reason: "Analysis is disabled." };
+  const now = new Date(), fallback = new Date(now.getTime() - 30 * 60_000);
   const cursor = config.lastCollectedAt?.toDate();
   const start = cursor ? new Date(Math.max(fallback.getTime(), cursor.getTime() - 10 * 60_000)) : fallback;
-  const counts = await collectRange(config, token, start, now);
+  const counts = await collectSoterRange(config, start, now);
   const completedStart = floorWindow(new Date(now.getTime() - config.windowMinutes * 60_000), config.windowMinutes);
   const analysis = await analyseStoredWindow(config, completedStart, true);
   await root().set({ lastCollectedAt: Timestamp.fromDate(now), lastCollectionStatus: "ok", lastCollectionCounts: counts, lastCollectionError: FieldValue.delete() }, { merge: true });
@@ -238,15 +198,24 @@ async function collectAndAnalyse(force = false) {
 }
 
 async function backfill(days: number) {
-  const config = await loadConfig(), token = await secret(TOKEN_SECRET), end = new Date(), first = new Date(end.getTime() - days * 86_400_000);
-  let sensorEvents = 0, soterEvents = 0;
+  const config = await loadConfig(), end = new Date(), first = new Date(end.getTime() - days * 86_400_000);
+  let soterEvents = 0;
   for (let cursor = first; cursor < end; cursor = new Date(cursor.getTime() + 86_400_000)) {
-    const counts = await collectRange(config, token, cursor, new Date(Math.min(end.getTime(), cursor.getTime() + 86_400_000)));
-    sensorEvents += counts.sensorEvents; soterEvents += counts.soterEvents;
+    const counts = await collectSoterRange(config, cursor, new Date(Math.min(end.getTime(), cursor.getTime() + 86_400_000)));
+    soterEvents += counts.soterEvents;
   }
   await rebuildRange(config, first, end);
   await root().set({ lastCollectedAt: Timestamp.fromDate(end), lastCollectionStatus: "ok" }, { merge: true });
-  return { days, sensorEvents, soterEvents };
+  return { days, soterEvents };
+}
+
+async function cleanupExpiredNonces() {
+  const snapshot = await root().collection("ingest_nonces").where("expiresAt", "<", Timestamp.now()).limit(400).get();
+  if (snapshot.empty) return 0;
+  const batch = getFirestore().batch();
+  snapshot.docs.forEach((document) => batch.delete(document.ref));
+  await batch.commit();
+  return snapshot.size;
 }
 
 async function rebuildRange(config: Config, first: Date, end: Date) {
@@ -305,22 +274,85 @@ function sanitize(input: unknown, existing: Config): Config {
     if (!Number.isInteger(value) || value < min || value > max) throw new Error(`${key} must be between ${min} and ${max}.`);
     return value;
   };
-  const base = String(body.homeAssistantBaseUrl ?? existing.homeAssistantBaseUrl).trim().replace(/\/$/, "");
-  if (base && !base.startsWith("https://")) throw new Error("Home Assistant URL must use HTTPS.");
   return {
     ...existing, enabled: body.enabled === undefined ? existing.enabled : Boolean(body.enabled),
     webhookEnabled: body.webhookEnabled === undefined ? existing.webhookEnabled : Boolean(body.webhookEnabled),
-    homeAssistantBaseUrl: base, timezone: String(body.timezone ?? existing.timezone).trim() || "Europe/London", entities,
+    timezone: String(body.timezone ?? existing.timezone).trim() || "Europe/London", entities,
     windowMinutes: integer("windowMinutes", existing.windowMinutes, 5, 60), baselineDays: integer("baselineDays", existing.baselineDays, 7, 180),
     minimumBaselineWindows: integer("minimumBaselineWindows", existing.minimumBaselineWindows, 7, 200), alertThreshold: integer("alertThreshold", existing.alertThreshold, 1, 99),
     consecutiveWindows: integer("consecutiveWindows", existing.consecutiveWindows, 1, 8), updatedAt: Timestamp.now(),
   };
 }
 
-const iso = (data: FirebaseFirestore.DocumentData) => Object.fromEntries(Object.entries(data).map(([key, value]) => [key, value instanceof Timestamp ? value.toDate().toISOString() : value]));
-interface AuthedRequest extends Request { user?: { email: string; uid: string } }
+const jsonValue = (value: unknown): unknown => {
+  if (value instanceof Timestamp) return value.toDate().toISOString();
+  if (Array.isArray(value)) return value.map(jsonValue);
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, jsonValue(nested)]));
+  return value;
+};
+const iso = (data: FirebaseFirestore.DocumentData) => Object.fromEntries(Object.entries(data).map(([key, value]) => [key, jsonValue(value)]));
+interface AuthedRequest extends Request { user?: { email: string; uid: string }; rawBody?: Buffer }
 const api = express();
-api.disable("x-powered-by"); api.use(express.json({ limit: "128kb" }));
+api.disable("x-powered-by");
+api.use(express.json({ limit: "256kb", verify: (request, _response, body) => { (request as AuthedRequest).rawBody = Buffer.from(body); } }));
+
+api.post("/api/ingest", async (req: AuthedRequest, res) => {
+  const rawBody = req.rawBody ?? Buffer.alloc(0), now = Date.now();
+  let signed: { timestamp: string; nonce: string };
+  let ingestSecret: string;
+  try { ingestSecret = await secret(INGEST_SECRET); }
+  catch (error) { logger.error("Collector secret is unavailable", error); res.status(503).json({ error: "Collector ingestion is not configured." }); return; }
+  try {
+    signed = verifySignature(ingestSecret, {
+      timestamp: req.header("X-Soter-Timestamp"), nonce: req.header("X-Soter-Nonce"), signature: req.header("X-Soter-Signature"),
+    }, rawBody, now);
+  } catch (error) {
+    logger.warn("Rejected collector authentication", { error: error instanceof Error ? error.message : String(error) });
+    res.status(401).json({ error: "Collector authentication failed." }); return;
+  }
+  let payload: ReturnType<typeof validatePayload>;
+  try {
+    const config = await loadConfig();
+    payload = validatePayload(req.body, config.entities, HOUSEHOLD, now);
+  } catch (error) {
+    logger.warn("Rejected collector payload", { error: error instanceof Error ? error.message : String(error) });
+    res.status(400).json({ error: error instanceof Error ? error.message : "Invalid collector payload." }); return;
+  }
+  try {
+    const nonceRef = root().collection("ingest_nonces").doc(hash(`${payload.collectorId}|${signed.nonce}`));
+    const sensors: IdentifiedSensor[] = payload.events.map((event) => ({
+      id: event.id, source: "home_assistant", entityId: event.entityId, kind: event.kind, state: event.state,
+      numericValue: event.numericValue, observedAt: Timestamp.fromDate(new Date(event.observedAt)), unit: event.unit,
+      friendlyName: event.friendlyName,
+    }));
+    await storeEvents(sensors, []);
+    const latestEvent = sensors.reduce<Date | undefined>((latest, event) => {
+      const observed = event.observedAt.toDate(); return !latest || observed > latest ? observed : latest;
+    }, undefined);
+    const collector: FirebaseFirestore.DocumentData = {
+      id: payload.collectorId, version: payload.health?.version ?? null, queueDepth: payload.health?.queueDepth ?? null,
+      sentAt: Timestamp.fromDate(new Date(payload.sentAt)), lastSeenAt: Timestamp.now(), status: "ok",
+    };
+    if (latestEvent) collector.lastEventAt = Timestamp.fromDate(latestEvent);
+    if (payload.health?.lastBackfillAt) collector.lastBackfillAt = Timestamp.fromDate(new Date(payload.health.lastBackfillAt));
+    await root().set({
+      sourceMode: "home_assistant_push", collector,
+      lastSensorIngestAt: Timestamp.now(), ...(latestEvent ? { lastSensorEventAt: Timestamp.fromDate(latestEvent) } : {}),
+    }, { merge: true });
+    try {
+      await nonceRef.create({ collectorId: payload.collectorId, signedAt: Timestamp.fromMillis(Number(signed.timestamp) * 1000), createdAt: Timestamp.now(), expiresAt: Timestamp.fromMillis(now + 10 * 60_000) });
+    } catch (error) {
+      const code = (error as { code?: number | string }).code;
+      if (code === 6 || code === "already-exists") { res.status(409).json({ error: "This signed request has already been accepted." }); return; }
+      throw error;
+    }
+    res.status(202).json({ accepted: sensors.length, duplicateSafe: true, receivedAt: new Date(now).toISOString() });
+  } catch (error) {
+    logger.error("Collector ingest failed", error);
+    res.status(500).json({ error: "The collector batch could not be stored; it is safe to retry." });
+  }
+});
+
 api.use(async (req: AuthedRequest, res: Response, next: NextFunction) => {
   if (req.method === "OPTIONS") { res.status(204).end(); return; }
   const token = req.header("Authorization")?.match(/^Bearer (.+)$/)?.[1];
@@ -351,7 +383,10 @@ api.use((_req, res) => res.status(404).json({ error: "Not found." }));
 
 export const haSensorsApi = onRequest({ region: REGION, serviceAccount: RUNTIME_SA, memory: "512MiB", timeoutSeconds: 540, maxInstances: 5 }, api);
 export const collectHaSensors = onSchedule({ region: REGION, serviceAccount: RUNTIME_SA, schedule: "every 5 minutes", timeZone: "Europe/London", memory: "512MiB", timeoutSeconds: 240, retryCount: 1 }, async () => {
-  try { logger.info("Collection complete", await collectAndAnalyse()); }
+  try {
+    const result = await collectAndAnalyse(), expiredNonces = await cleanupExpiredNonces();
+    logger.info("Collection complete", { ...result, expiredNonces });
+  }
   catch (error) {
     logger.error("Collection failed", error);
     await root().set({ lastCollectionStatus: "error", lastCollectionError: error instanceof Error ? error.message : String(error), lastCollectionAttemptAt: Timestamp.now() }, { merge: true });

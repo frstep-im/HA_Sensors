@@ -1,0 +1,34 @@
+name: Soter Activity Collector
+version: "0.1.0"
+slug: soter_activity_collector
+description: Securely sends selected Home Assistant sensor changes to the Soter normality service.
+url: https://github.com/frstep-im/HA_Sensors/tree/main/home_assistant_collector
+startup: application
+boot: auto
+init: false
+homeassistant_api: true
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+options:
+  firebase_ingest_url: https://soter-normality.web.app/api/ingest
+  household_id: household-mpcck67b-epr7fs
+  collector_id: haos-collector-001
+  ingest_secret: null
+  entities: []
+  upload_interval_seconds: 60
+  history_backfill_hours: 336
+schema:
+  firebase_ingest_url: url
+  household_id: "match(^household-[a-z0-9-]+$)"
+  collector_id: "match(^[A-Za-z0-9][A-Za-z0-9_-]*$)"
+  ingest_secret: password
+  entities:
+    - entity_id: "match(^[a-z0-9_]+\\.[a-z0-9_]+$)"
+      kind: "list(motion|current|power)"
+      label: "str?"
+  upload_interval_seconds: "int(15,900)"
+  history_backfill_hours: "int(1,1008)"
