@@ -10,7 +10,9 @@
     "lint": "npm run lint -w functions && npm run lint -w web",
     "dev": "npm run dev -w web",
     "secret:ingest": "./scripts/set-secret.sh ha-sensors-ingest-secret 'shared collector ingest secret (32+ characters)'",
-    "secret:webhook": "./scripts/set-secret.sh ha-sensors-alert-webhook 'alert webhook URL'"
+    "secret:webhook": "./scripts/set-secret.sh ha-sensors-alert-webhook 'alert webhook URL'",
+    "secret:smtp": "./scripts/set-secret.sh ha-sensors-smtp-url 'SMTP connection URL (for example smtps://user:password@smtp.example.com:465)'",
+    "secret:email-from": "./scripts/set-secret.sh ha-sensors-email-from 'email From header (for example Soter Activity <alerts@example.com>)'"
   },
   "engines": { "node": "22" }
 }

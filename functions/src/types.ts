@@ -24,6 +24,14 @@ export interface Config {
   updatedBy?: string;
 }
 
+export interface EmailPreferences {
+  email: string;
+  thresholdEnabled: boolean;
+  threshold: number;
+  scheduleTimes: string[];
+  updatedAt?: FirebaseFirestore.Timestamp;
+}
+
 export interface CollectorHealth {
   id: string;
   version?: string;

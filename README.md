@@ -59,6 +59,15 @@ Optional alert webhook URLs use a separate secret:
 npm run secret:webhook
 ```
 
+Email notifications use an SMTP account. Configure both secrets before enabling threshold or scheduled emails in the dashboard. The SMTP URL is kept in Secret Manager and should URL-encode special characters in the username or password:
+
+```sh
+npm run secret:smtp
+npm run secret:email-from
+```
+
+Each authenticated user manages their own recipient settings. The recipient is fixed to that user’s verified Firebase Authentication email. Threshold messages are evaluated after each scored checkpoint; scheduled summaries accept up to 12 `HH:MM` local times per day. Delivery records prevent the same checkpoint or scheduled slot from being emailed twice.
+
 One-time least-privilege runtime identity:
 
 ```sh

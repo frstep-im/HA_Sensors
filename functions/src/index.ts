@@ -7,12 +7,14 @@ import { logger } from "firebase-functions";
 import { onRequest } from "firebase-functions/v2/https";
 import { onSchedule } from "firebase-functions/v2/scheduler";
 import { createHash } from "node:crypto";
+import nodemailer from "nodemailer";
 import { isMotionActive, isTelevision, PowerSample, televisionFeatures, televisionSessions } from "./activity";
 import { checkpointLabel, checkpointStart, checkpointsBetween, latestCheckpoint } from "./checkpoints";
+import { dueScheduleSlots, sanitizeEmailPreferences } from "./email";
 import { validatePayload, verifySignature } from "./ingest";
 import { analyse } from "./normality";
 import { conversationHistoryCard, conversationTypes } from "./soter";
-import { Config, EntityConfig, Features, SensorEvent, SensorKind, SoterEvent, SoterEventType, SoterHistoryCard } from "./types";
+import { Config, EmailPreferences, EntityConfig, Features, SensorEvent, SensorKind, SoterEvent, SoterEventType, SoterHistoryCard } from "./types";
 
 initializeApp();
 
@@ -24,6 +26,8 @@ const REGION = "australia-southeast1";
 const RUNTIME_SA = `ha-sensors-runtime@${TARGET_PROJECT}.iam.gserviceaccount.com`;
 const INGEST_SECRET = "ha-sensors-ingest-secret";
 const WEBHOOK_SECRET = "ha-sensors-alert-webhook";
+const SMTP_URL_SECRET = "ha-sensors-smtp-url";
+const EMAIL_FROM_SECRET = "ha-sensors-email-from";
 const root = () => getFirestore().collection("normality_households").doc(HOUSEHOLD);
 const secrets = new SecretManagerServiceClient();
 const admins = new Set((process.env.ADMIN_EMAILS ?? "intermentisai@gmail.com,fraser@intermentis.com,benoit.auvray@gmail.com").split(",").map((v) => v.trim().toLowerCase()));
@@ -45,6 +49,98 @@ async function secret(id: string) {
   const value = version.payload?.data?.toString().trim();
   if (!value) throw new Error(`Secret ${id} is missing or empty.`);
   return value;
+}
+
+let mailerPromise: Promise<{ transport: nodemailer.Transporter; from: string }> | undefined;
+function mailer() {
+  if (!mailerPromise) mailerPromise = Promise.all([secret(SMTP_URL_SECRET), secret(EMAIL_FROM_SECRET)])
+    .then(([smtpUrl, from]) => ({ transport: nodemailer.createTransport(smtpUrl), from }))
+    .catch((error) => { mailerPromise = undefined; throw error; });
+  return mailerPromise;
+}
+
+const emailPreferencesRef = (uid: string) => root().collection("email_subscriptions").doc(uid);
+const defaultEmailPreferences = (email: string, config: Config): EmailPreferences => ({ email, thresholdEnabled: false, threshold: config.alertThreshold, scheduleTimes: [] });
+
+async function loadEmailPreferences(uid: string, email: string, config: Config) {
+  const snapshot = await emailPreferencesRef(uid).get();
+  return snapshot.exists
+    ? sanitizeEmailPreferences(snapshot.data() ?? {}, email, defaultEmailPreferences(email, config))
+    : defaultEmailPreferences(email, config);
+}
+
+const escapeHtml = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]!);
+const localEmailTime = (date: Date, timezone: string) => new Intl.DateTimeFormat("en-GB", { timeZone: timezone, dateStyle: "medium", timeStyle: "short" }).format(date);
+function emailBody(title: string, introduction: string, rows: Array<[string, string]>) {
+  const rowHtml = rows.map(([label, value]) => `<tr><th style="padding:7px 12px 7px 0;text-align:left;color:#60716c;font-weight:600">${escapeHtml(label)}</th><td style="padding:7px 0;color:#203b3f">${escapeHtml(value)}</td></tr>`).join("");
+  return `<div style="font-family:Arial,sans-serif;max-width:620px;margin:auto;color:#263b3e"><div style="padding:24px;border:1px solid #dce5df;border-radius:18px"><div style="color:#167a68;font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase">Soter Activity</div><h1 style="margin:8px 0 12px;font-size:26px">${escapeHtml(title)}</h1><p style="line-height:1.55;color:#51605c">${escapeHtml(introduction)}</p><table style="border-collapse:collapse;font-size:14px">${rowHtml}</table><p style="margin:22px 0 0"><a href="https://soter-normality.web.app" style="color:#167a68;font-weight:700">Open the activity dashboard</a></p></div><p style="color:#89948f;font-size:11px;text-align:center">Decision support only; not an emergency or medical monitoring service.</p></div>`;
+}
+
+async function sendEmailOnce(uid: string, deliveryKey: string, message: { to: string; subject: string; html: string }, strict = false) {
+  const ref = root().collection("email_deliveries").doc(hash(`${uid}|${deliveryKey}`));
+  const reserved = await getFirestore().runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(ref), data = snapshot.data();
+    const lastAttemptAt = data?.lastAttemptAt instanceof Timestamp ? data.lastAttemptAt.toMillis() : 0;
+    if (data?.status === "sent" || (data?.status === "sending" && lastAttemptAt > 0 && Date.now() - lastAttemptAt < 10 * 60_000) || Number(data?.attempts ?? 0) >= 3) return false;
+    transaction.set(ref, { uid, deliveryKey, to: message.to, status: "sending", attempts: FieldValue.increment(1), lastAttemptAt: Timestamp.now(), expiresAt: Timestamp.fromMillis(Date.now() + 90 * 86_400_000) }, { merge: true });
+    return true;
+  });
+  if (!reserved) return "duplicate" as const;
+  try {
+    const sender = await mailer();
+    const info = await sender.transport.sendMail({ from: sender.from, ...message });
+    await ref.set({ status: "sent", sentAt: Timestamp.now(), messageId: info.messageId ?? null, lastError: FieldValue.delete() }, { merge: true });
+    return "sent" as const;
+  } catch (error) {
+    const messageText = error instanceof Error ? error.message : String(error);
+    await ref.set({ status: "failed", failedAt: Timestamp.now(), lastError: messageText.slice(0, 500) }, { merge: true });
+    logger.error("Activity email delivery failed", { uid, deliveryKey, error: messageText });
+    if (strict) throw error;
+    return "failed" as const;
+  }
+}
+
+async function emailSubscriptions() {
+  const snapshot = await root().collection("email_subscriptions").get();
+  return snapshot.docs.flatMap((document) => {
+    const data = document.data() as Partial<EmailPreferences>;
+    return typeof data.email === "string" ? [{ uid: document.id, preferences: data as EmailPreferences }] : [];
+  });
+}
+
+async function sendThresholdEmails(config: Config, end: Date, result: ReturnType<typeof analyse>) {
+  if (result.normalityIndex === null) return 0;
+  const subscriptions = await emailSubscriptions();
+  const recipients = subscriptions.filter(({ preferences }) => preferences.thresholdEnabled && result.normalityIndex! < Number(preferences.threshold));
+  await Promise.all(recipients.map(({ uid, preferences }) => sendEmailOnce(uid, `threshold-${windowId(end)}`, {
+    to: preferences.email,
+    subject: `Soter activity alert — normality ${result.normalityIndex}`,
+    html: emailBody("Activity is outside your email threshold", result.reasons[0] ?? "The latest activity checkpoint differs from the learned household routine.", [
+      ["Normality", String(result.normalityIndex)], ["Your email threshold", String(preferences.threshold)], ["Checkpoint", localEmailTime(end, config.timezone)],
+    ]),
+  })));
+  return recipients.length;
+}
+
+async function sendScheduledEmails(config: Config, now: Date) {
+  const subscriptions = await emailSubscriptions();
+  const due = subscriptions.flatMap(({ uid, preferences }) => dueScheduleSlots(preferences.scheduleTimes ?? [], now, config.timezone).map((slot) => ({ uid, preferences, slot })));
+  if (!due.length) return 0;
+  const windows = await root().collection("windows").orderBy("endAt", "desc").limit(10).get();
+  const latest = windows.docs.map((document) => document.data()).find((window) => typeof window.checkpoint === "string");
+  await Promise.all(due.map(({ uid, preferences, slot }) => {
+    const normality = typeof latest?.normalityIndex === "number" ? String(latest.normalityIndex) : "Still learning";
+    const status = String(latest?.status ?? "learning");
+    const reason = Array.isArray(latest?.reasons) ? String(latest.reasons[0] ?? "No explanation available.") : "No explanation available.";
+    return sendEmailOnce(uid, `scheduled-${slot.id}`, {
+      to: preferences.email,
+      subject: `Soter activity update — ${slot.time}`,
+      html: emailBody("Your scheduled activity update", reason, [
+        ["Normality", normality], ["Status", status], ["Summary time", `${slot.localDate} ${slot.time} (${config.timezone})`],
+      ]),
+    });
+  }));
+  return due.length;
 }
 
 interface IdentifiedSensor extends SensorEvent { id: string }
@@ -182,6 +278,7 @@ async function analyseStoredCheckpoint(config: Config, end: Date, sendAlert: boo
   }
   const id = `checkpoint-${windowId(end)}`;
   await root().collection("windows").doc(id).set({ startAt: from, endAt: to, checkpoint, periodHours: 6, features, ...result, consecutiveUnusualWindows: consecutive, analysedAt: Timestamp.now() }, { merge: true });
+  if (sendAlert) await sendThresholdEmails(config, end, result);
   if (sendAlert && result.status === "alert") await createAlert(config, id, end, result, features);
   return { id, startAt: start.toISOString(), endAt: end.toISOString(), checkpoint, features, ...result };
 }
@@ -381,16 +478,19 @@ api.use(async (req: AuthedRequest, res: Response, next: NextFunction) => {
   } catch { res.status(401).json({ error: "The session is invalid or expired." }); }
 });
 
-api.get("/api/overview", async (req, res) => {
+api.get("/api/overview", async (req: AuthedRequest, res) => {
   const hours = Math.min(2160, Math.max(1, Number(req.query.hours) || 48)), since = Timestamp.fromMillis(Date.now() - hours * 3_600_000);
-  const [config, windows, alerts, health] = await Promise.all([
-    loadConfig(), root().collection("windows").where("endAt", ">=", since).orderBy("endAt").get(),
+  const config = await loadConfig();
+  const [windows, alerts, health, emailPreferences] = await Promise.all([
+    root().collection("windows").where("endAt", ">=", since).orderBy("endAt").get(),
     root().collection("alerts").where("observedAt", ">=", since).orderBy("observedAt", "desc").limit(50).get(), root().get(),
+    loadEmailPreferences(req.user!.uid, req.user!.email, config),
   ]);
   res.json({
     config: iso(config as unknown as FirebaseFirestore.DocumentData), health: iso(health.data() ?? {}),
     windows: windows.docs.filter((document) => typeof document.data().checkpoint === "string").map((document) => ({ id: document.id, ...iso(document.data()) })),
     alerts: alerts.docs.map((document) => ({ id: document.id, ...iso(document.data()) })),
+    emailPreferences: iso(emailPreferences as unknown as FirebaseFirestore.DocumentData),
   });
 });
 api.get("/api/events", async (req, res) => {
@@ -447,6 +547,25 @@ api.put("/api/config", async (req: AuthedRequest, res) => {
   try { const config = sanitize(req.body, await loadConfig()); config.updatedBy = req.user?.email; await root().set(config, { merge: true }); res.json({ config }); }
   catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : String(error) }); }
 });
+api.put("/api/email-preferences", async (req: AuthedRequest, res) => {
+  try {
+    const config = await loadConfig(), existing = await loadEmailPreferences(req.user!.uid, req.user!.email, config);
+    const preferences = sanitizeEmailPreferences(req.body, req.user!.email, existing);
+    await emailPreferencesRef(req.user!.uid).set({ ...preferences, updatedAt: Timestamp.now() }, { merge: true });
+    res.json({ emailPreferences: preferences });
+  } catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+api.post("/api/email-preferences/test", async (req: AuthedRequest, res) => {
+  try {
+    const config = await loadConfig(), preferences = await loadEmailPreferences(req.user!.uid, req.user!.email, config);
+    const result = await sendEmailOnce(req.user!.uid, `test-${Date.now()}`, {
+      to: preferences.email,
+      subject: "Soter activity email test",
+      html: emailBody("Email alerts are connected", "This test confirms that Soter Activity can send notifications to your verified login email.", [["Recipient", preferences.email], ["Timezone", config.timezone]]),
+    }, true);
+    res.json({ result });
+  } catch (error) { res.status(502).json({ error: error instanceof Error ? error.message : "Test email could not be sent." }); }
+});
 api.post("/api/collect", async (_req, res) => { try { res.json(await collectAndAnalyse(true)); } catch (e) { res.status(502).json({ error: e instanceof Error ? e.message : String(e) }); } });
 api.post("/api/backfill", async (req, res) => { try { res.json(await backfill(Math.min(42, Math.max(1, Number(req.body?.days) || 14)))); } catch (e) { res.status(502).json({ error: e instanceof Error ? e.message : String(e) }); } });
 api.post("/api/alerts/:id/acknowledge", async (req: AuthedRequest, res) => { await root().collection("alerts").doc(String(req.params.id)).set({ status: "acknowledged", acknowledgedAt: Timestamp.now(), acknowledgedBy: req.user?.email }, { merge: true }); res.json({ ok: true }); });
@@ -455,8 +574,9 @@ api.use((_req, res) => res.status(404).json({ error: "Not found." }));
 export const haSensorsApi = onRequest({ region: REGION, serviceAccount: RUNTIME_SA, memory: "512MiB", timeoutSeconds: 540, maxInstances: 5 }, api);
 export const collectHaSensors = onSchedule({ region: REGION, serviceAccount: RUNTIME_SA, schedule: "every 5 minutes", timeZone: "Europe/London", memory: "512MiB", timeoutSeconds: 240, retryCount: 1 }, async () => {
   try {
-    const result = await collectAndAnalyse(), expiredNonces = await cleanupExpiredNonces();
-    logger.info("Collection complete", { ...result, expiredNonces });
+    const result = await collectAndAnalyse(), config = await loadConfig();
+    const [expiredNonces, scheduledEmails] = await Promise.all([cleanupExpiredNonces(), sendScheduledEmails(config, new Date())]);
+    logger.info("Collection complete", { ...result, expiredNonces, scheduledEmails });
   }
   catch (error) {
     logger.error("Collection failed", error);
