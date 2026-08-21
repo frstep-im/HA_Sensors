@@ -37,7 +37,7 @@
 .event-filters button { border: 0; border-radius: 8px; padding: 7px 10px; background: transparent; color: #6c7975; font-size: 11px; cursor: pointer; text-transform: capitalize; }
 .event-filters button.active { background: #e7f2ed; color: var(--deep); font-weight: 600; }
 .event-timeline { min-height: 250px; overflow-x: auto; overflow-y: hidden; }
-.event-timeline > svg { width: 100%; min-width: 760px; height: 100%; }
+.event-timeline > svg { width: 100%; min-width: 800px; height: auto; }
 .lane-label { fill: #536560; font: 600 11px "DM Sans", sans-serif; }
 .lane-line { stroke: #d9dfda; stroke-width: 1; }
 .event-grid { stroke: #e7ebe7; stroke-width: 1; stroke-dasharray: 2 4; }
@@ -50,6 +50,8 @@
 .event-dot.visitor_arrival { fill: #d28a42; }
 .event-dot.door_left_open { fill: #b64d45; stroke-width: 2; }
 .event-session { fill: #516d79; stroke: #fff; stroke-width: 1.5; opacity: .9; }
+.event-legend { display: flex; flex-wrap: wrap; gap: 7px 15px; padding: 4px 0 9px 145px; color: #66746f; font-size: 10px; }
+.event-legend i { display: inline-block; width: 8px; height: 8px; margin-right: 6px; border-radius: 50%; }
 .event-summary { display: flex; gap: 18px; flex-wrap: wrap; padding: 3px 0 15px; color: #7c8884; font-size: 11px; }
 .event-summary span + span::before { content: "·"; margin-right: 18px; color: #b4bdb9; }
 .inline-error { padding: 10px 12px; margin-bottom: 10px; border-radius: 9px; color: #8b403b; background: #f9e5df; font-size: 12px; }
@@ -59,6 +61,7 @@
   #patterns .interactive-chart > svg, .activity-chart > svg { min-width: 760px; }
   .event-browser .tools { width: 100%; justify-content: flex-start; }
   .event-filters { width: 100%; overflow-x: auto; }
+  .event-legend { padding-left: 0; }
   .event-summary span + span::before { display: none; }
   .axis-text { font-size: 9px; }
   .chart-help { align-items: flex-start; }
