@@ -92,6 +92,7 @@ async function sendEmailOnce(uid: string, deliveryKey: string, message: { to: st
     await ref.set({ status: "sent", sentAt: Timestamp.now(), messageId: info.messageId ?? null, lastError: FieldValue.delete() }, { merge: true });
     return "sent" as const;
   } catch (error) {
+    mailerPromise = undefined;
     const messageText = error instanceof Error ? error.message : String(error);
     await ref.set({ status: "failed", failedAt: Timestamp.now(), lastError: messageText.slice(0, 500) }, { merge: true });
     logger.error("Activity email delivery failed", { uid, deliveryKey, error: messageText });
